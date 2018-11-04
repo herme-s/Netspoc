@@ -174,29 +174,33 @@ sub remove_attribute_src_code {
     change_attribute_src_code($attr, $object, '');
 }
 
+# Collect objects, that will be shown in output.
+my %is_used;
+
+# Collect networks that need to be connected by unmanaged parts of topology.
+my @todo_unmanaged;
+
 # This function is called by path_walk to mark all managed routers
 # on path from src to dst of $rule with attribute {is_used}.
 sub mark_topology {
     my (undef, $in_intf, $out_intf) = @_;
     my $router = ($in_intf || $out_intf)->{router};
-    $router->{is_used} = 1;
+    $is_used{$router} = 1;
 #    debug "Used $router->{name}";
-    if ($in_intf) {
-        $in_intf->{is_used} = 1;
-        $in_intf->{network}->{is_used} = 1;
+    for my $intf ($in_intf, $out_intf) {
+        $intf or next;
+        my $network = $intf->{network};
+        $is_used{$intf} = 1;
+        $is_used{$network} = 1;
+        push @todo_unmanaged, $network;
     }
-    if ($out_intf) {
-        $out_intf->{is_used} = 1;
-        $out_intf->{network}->{is_used} = 1;
-    }
-    return;
 }
 
 # Mark unmanaged routers and networks
 # between marked and managed parts of topology.
 sub path_unmanaged {
     my ($obj, $in_interface) = @_;
-    return 1 if $obj->{is_used};
+    return 1 if $is_used{$obj};
     return if $obj->{managed} || $obj->{semi_managed};
     return if $obj->{active_path};
 
@@ -206,32 +210,31 @@ sub path_unmanaged {
         next if $interface eq $in_interface;
         next if $interface->{main_interface};
         my $next = $interface->{is_network($obj) ? 'router' : 'network'};
-	if (path_unmanaged($next, $interface)) {
-	    $obj->{is_used} = 1;
-            $interface->{is_used} = 1;
-#	    debug "Marked $interface->{name}";
-	    $result = 1;
-	}
+        if (path_unmanaged($next, $interface)) {
+            $is_used{$obj} = 1;
+            $is_used{$interface} = 1;
+#            debug "Marked $interface->{name}";
+            $result = 1;
+        }
     }
     return $result;
 }
 
 sub mark_unmanaged {
     progress('Marking unmanged routers');
-    for my $network (values %networks) {
-	next if not $network->{is_used};
+    for my $network (@todo_unmanaged) {
 #        debug "Path unmanaged $network->{name}";
-	for my $interface (@{ $network->{interfaces} }) {
+        for my $interface (@{ $network->{interfaces} }) {
             next if $interface->{main_interface};
-	    my $router = $interface->{router};
-#	    debug "Try $router->{name} $interface->{name}";
-	    if (path_unmanaged($router, $interface)) {
-                $interface->{is_used} = 1;
+            my $router = $interface->{router};
+#            debug "Try $router->{name} $interface->{name}";
+            if (path_unmanaged($router, $interface)) {
+                $is_used{$interface} = 1;
 #                debug "Marked $interface->{name}";
             }
-	}
+        }
     }
-    return;
+    @todo_unmanaged = ();
 }
 
 sub mark_path {
@@ -281,15 +284,13 @@ if (@ARGV) {
         my ($type, $name) = split_typed_name $arg;
         my $ref = $name2var{$type} or pod2usage(2);
         my $thing = $ref->{$name} or fatal_err "Unknown $arg";
-        $thing->{is_used} = 1;
+        $is_used{$thing} = 1;
     }
 
     # Delete unwanted global definitions.
     for my $ref (values %name2var) {
         for my $name (keys %$ref) {
-            unless ($ref->{$name}->{is_used}) {
-                delete $ref->{$name};
-            }
+            $is_used{$ref->{$name}} or delete $ref->{$name};
         }
     }
 }
@@ -319,19 +320,19 @@ sub process_rules {
             # Mark all objects additionally here.
             my $type = ref $obj;
             if ($type eq 'Network') {
-#	        debug "Used $obj->{name}";
-                $obj->{is_used} = 1;
+#	             debug "Used $obj->{name}";
+                $is_used{$obj} = 1;
             }
             elsif ($type eq 'Host') {
-                $obj->{is_used} = 1;
+                $is_used{$obj} = 1;
 #	        debug "Used $obj->{name}";
-                $obj->{network}->{is_used} = 1;
+                $is_used{$obj->{network}} = 1;
             }
             elsif ($type eq 'Interface') {
-                $obj->{is_used} = 1;
+                $is_used{$obj} = 1;
 #	        debug "Used $obj->{name}";
-                $obj->{router}->{is_used} = 1;
-                $obj->{network}->{is_used} = 1;
+                $is_used{$obj->{router}} = 1;
+                $is_used{$obj->{network}} = 1;
             }
         }
         &path_walk($rule, \&mark_topology);
@@ -339,6 +340,22 @@ sub process_rules {
     return;
 }
 
+# Collect objects, that are referenced, but not visible in rules:
+# Groups, networks, interfaces, hosts from negated part of intersection.
+# These need to be connected with other parts of topology
+# by managed an unmanaged routers.
+my @todo_managed;
+for my $global (\%groups, \%networks, \%hosts, \%interfaces, 
+                \%aggregates, \%areas) 
+{
+    for my $obj (values %$global) {
+        $obj->{is_used} or next;
+        next if $is_used{$obj};
+        $is_used{$obj} = 1;
+        push @todo_managed, $obj;
+    }
+}
+        
 # Mark parts of topology which are referenced by rules of services.
 process_rules(\%path_rules);
 
@@ -346,17 +363,17 @@ process_rules(\%path_rules);
 get_zones();
 for my $zone (@all_zones) {
     for my $aggregate (values %{ $zone->{ipmask2aggregate} }) {
-        $aggregate->{is_used} or next;
+        $is_used{$aggregate} or next;
 #        debug "Marking networks of $aggregate->{name} in $zone->{name}";
         for my $network (@{ $aggregate->{networks} }) {
-            $network->{is_used} = 1;
+            $is_used{$network} = 1;
         }
     }
 }
 
 # Mark zones having attributes that influence their networks.
 for my $network (values %networks) {
-    $network->{is_used} or next;
+    $is_used{$network} or next;
     my $zone = $network->{zone};
     my $zero_ip = get_zero_ip($zone->{ipv6});
     my $aggregate0 = $zone->{ipmask2aggregate}->{"$zero_ip$zero_ip"};
@@ -365,45 +382,50 @@ for my $network (values %networks) {
     $aggregate0->{owner} = $zone->{owner};
 
     grep { $zone->{$_} } qw(has_unenforceable nat no_in_acl) or next;
-    $aggregate0->{is_used} = 1;
-    $zone->{is_used} = 1;
+    $is_used{$aggregate0} = 1;
+    $is_used{$zone} = 1;
 }
 
 for my $zone (@all_zones) {
-    $zone->{is_used} or next;
+    $is_used{$zone} or next;
     if (my $link = $zone->{link}) {
-        $link->{is_used} = 1;
+        $is_used{$link} = 1;
     }
 }
 
 # Mark areas having attributes that influence their networks.
 for my $zone (@all_zones) {
-    $zone->{is_used} or next;
+    $is_used{$zone} or next;
     for my $area (values %{ $zone->{areas} }) {
         $area->{nat} or next;
-        $area->{is_used} = 1;
+        $is_used{$area} = 1;
     }
 }
 
-# Mark interfaces which are referenced by used areas.
+# Mark interfaces / networks which are referenced by used areas.
 for my $area (values %areas) {
-    $area->{is_used} or next;
+    $is_used{$area} or next;
     if (my $anchor = $area->{anchor}) {
-        $anchor->{is_used} = 1;
+        $is_used{$anchor} = 1;
+        push @todo_managed, $anchor;
     }
     else {
         for my $interface (@{ $area->{border} }, @{ $area->{inclusive_border} })
         {
-            $interface->{is_used} = 1;
-            $interface->{router}->{is_used} = 1;
-            $interface->{network}->{is_used} = 1;
+            push @todo_managed, 
+                $interface,
+                $interface->{router},
+                $interface->{network};
+            $is_used{$interface} = 1;
+            $is_used{$interface->{router}} = 1;
+            $is_used{$interface->{network}} = 1;
         }
     }
 }
 
 # Mark networks having NAT attributes that influence their subnets.
 for my $network (values %networks) {
-    $network->{is_used} or next;
+    $is_used{$network} or next;
     my $up = $network;
     my @up_chain;
 
@@ -417,8 +439,8 @@ for my $network (values %networks) {
             my $zone = $up->{zone};
 
             # Check if NAT attribute was inherited from zone or areas.
-            $zone->{is_used} or
-                grep { $_->{is_used} } values %{ $zone->{areas} } or
+            $is_used{$zone} or
+                grep { $is_used{$_} } values %{ $zone->{areas} } or
                 next;
         }
         else {
@@ -426,7 +448,8 @@ for my $network (values %networks) {
             $up->{nat} or next;
         }
         for my $supernet (@up_chain) {
-            $supernet->{is_used} = 1;
+            $is_used{$supernet} = 1;
+            push @todo_unmanaged, $supernet;
 #            debug "marked: $supernet->{name}";
         }
         @up_chain = ();
@@ -442,21 +465,21 @@ mark_unmanaged();
 
 # Mark bridge and bridged networks.
 for my $network (values %networks) {
-    $network->{is_used} or next;
+    $is_used{$network} or next;
     $network->{bridged} or next;
     for my $bridge_in (@{ $network->{interfaces} }) {
         $bridge_in->{ip} eq 'bridged' or next;
-        $bridge_in->{is_used} = 1;
+        $is_used{$bridge_in} = 1;
         my $bridge = $bridge_in->{router};
-        $bridge->{is_used} = 1;
+        $is_used{$bridge} = 1;
         for my $bridge_out (@{ $bridge->{interfaces} }) {
             if ($bridge_out->{hardware}->{name} eq 'device' &&
                 $bridge->{model}->{class} eq 'ASA') {
-                $bridge_out->{is_used} = 1;
+                $is_used{$bridge_out} = 1;
             }
             elsif ($bridge_out->{ip} eq 'bridged') {
-                $bridge_out->{is_used} = 1;
-                $bridge_out->{network}->{is_used} = 1;
+                $is_used{$bridge_out} = 1;
+                $is_used{$bridge_out->{network}} = 1;
             }
         }
     }
@@ -468,30 +491,32 @@ for my $router (values %routers, values %routers6) {
     for my $interface (get_intf($router)) {
         my $fragment = $interface->{router};
         next if $fragment eq $router;
-        $fragment->{is_used} or next;
+        $is_used{$fragment} or next;
 #        debug "From split: $router->{name}";
-        $router->{is_used} = 1;
+        $is_used{$router} = 1;
     }
 
-    $router->{is_used} or next;
+    $is_used{$router} or next;
 
     # Mark fragments of marked crypto routers.
     for my $interface (get_intf($router)) {
         my $fragment = $interface->{router};
         next if $fragment eq $router;
 #        debug "Fragment: $fragment->{name}";
-        $fragment->{is_used} = 1;
+        $is_used{$fragment} = 1;
     }
 
-    # Mark path of crypto tunnels.
-    # Mark main interface of secondary or virtual interface.
     for my $interface (get_intf($router)) {
-        $interface->{is_used} or next;
+        $is_used{$interface} or next;
+
+        # Mark main interface of secondary or virtual interface.
         if (my $main = $interface->{main_interface} || $interface->{orig_main})
         {
-            $main->{is_used} = 1;
+            $is_used{$main} = 1;
         }
-	if ($interface->{ip} eq 'tunnel') {
+
+        # Mark path of crypto tunnel.
+        if ($interface->{ip} eq 'tunnel') {
             my $peer = $interface->{peer};
             my $real_intf = $interface->{real_interface};
             mark_path($real_intf, $peer->{real_interface});
@@ -500,17 +525,17 @@ for my $router (values %routers, values %routers6) {
 }
 
 # 2. call to mark unmanaged parts of topology.
-# Needed to mark crypto path of unmanaged crypto routers.
+# Needed to mark crypto path of crypto routers.
 mark_unmanaged();
 
 for my $router (values %routers, values %routers6) {
-    $router->{is_used} or next;
+    $is_used{$router} or next;
     for my $interface (get_intf($router)) {
-        $interface->{is_used} or next;
+        $is_used{$interface} or next;
 
 	# Remove unused networks referenced in attribute reroute_permit.
 	if (my $networks = $interface->{reroute_permit}) {
-            my @used_networks = grep { $_->{is_used} } @$networks;
+            my @used_networks = grep { $is_used{$_} } @$networks;
             if (not @used_networks) {
                 remove_attribute_src_code('reroute_permit', $router);
             }
@@ -526,17 +551,17 @@ for my $router (values %routers, values %routers6) {
 	# already marked interfaces.
         if (my $crypto_list = $interface->{hub}) {
             for my $crypto (@$crypto_list) {
-                $crypto->{is_used} = 1;
+                $is_used{$crypto} = 1;
                 my $type = $crypto->{type};
-                $type->{is_used} = 1;
-                $type->{key_exchange}->{is_used} = 1;
+                $is_used{$type} = 1;
+                $is_used{$type->{key_exchange}} = 1;
             }
         }
 
         # Mark networks referenced by interfaces
         # implictly marked by expand_group.
-        if ($interface->{is_used}) {
-            $interface->{network}->{is_used} = 1;
+        if ($is_used{$interface}) {
+            $is_used{$interface->{network}} = 1;
         }
     }
 }
@@ -544,18 +569,18 @@ for my $router (values %routers, values %routers6) {
 # Remove definitions of unused hosts from networks.
 progress('Removing unused hosts');
 for my $network (values %networks) {
-    $network->{is_used} or next;
+    $is_used{$network} or next;
     my $hosts = $network->{hosts};
 
     # Retain at least one host of network with ID hosts.
     if ($network->{has_id_hosts}) {
-        if (not grep { $_->{is_used} } @$hosts) {
-            $hosts->[0]->{is_used} = 1;
+        if (not grep { $is_used{$_} } @$hosts) {
+            $is_used{$hosts->[0]} = 1;
         }
     }
 
     for my $host (@$hosts) {
-        next if $host->{is_used};
+        next if $is_used{$host};
         my $name = $host->{name};
 
         # Remove trailing network name of ID-host.
@@ -570,9 +595,9 @@ for my $network (values %networks) {
 # Remove definitions of unused interfaces from routers
 progress('Removing unused interfaces');
 for my $router (values %routers, values %routers6) {
-    $router->{is_used} or next;
+    $is_used{$router} or next;
     for my $interface (get_intf($router)) {
-        next if $interface->{is_used};
+        next if $is_used{$interface};
         next if $interface->{ip} eq 'tunnel';
 
         # Rename "interface:router.network" to "interface:network".
@@ -594,7 +619,7 @@ for my $object (values %networks,
                 values %routers, values %routers6,
                 values %areas, values %aggregates)
 {
-    $object->{is_used} or next;
+    $is_used{$object} or next;
     $object->{src_code} or next;
     while ($object->{src_code} =~ /^[^#]*owner *=/m) {
 #        progress("- $object->{name}");
@@ -612,7 +637,7 @@ for my $service (values %services) {
 # Remove attribute 'router_attributes'
 # with 'owner', 'policy_distribution_point' and 'general_permit'.
 for my $area (values %areas) {
-    $area->{is_used} or next;
+    $is_used{$area} or next;
     $area->{router_attributes} or next;
     remove_attribute_src_code('router_attributes', $area);
 }
@@ -620,7 +645,7 @@ for my $area (values %areas) {
 # Remove attribute 'policy_distribution_point'
 progress('Removing referenced policy_distribution_point');
 for my $router (values %routers, values %routers6) {
-    $router->{is_used} or next;
+    $is_used{$router} or next;
     $router->{policy_distribution_point} or next;
     $router->{src_code} =~ /^[^#]policy_distribution_point/m or next;
     remove_attribute_src_code('policy_distribution_point', $router);
@@ -641,14 +666,12 @@ for my $object ( sort by_index map { $_->{src_index} ? ($_) : () }
     values %aggregates,
     values %areas,
     values %groups,
-    values %protocols,
-    values %protocolgroups,
     values %isakmp,
     values %ipsec,
     values %crypto,
   )
 {
-    if ($object->{is_used}) {
+    if ($is_used{$object}) {
 
         # There are some internal objects without src_code.
         if (my $src_code = $object->{src_code}) {
@@ -657,12 +680,20 @@ for my $object ( sort by_index map { $_->{src_index} ? ($_) : () }
     }
 }
 
+for my $object ( sort by_index map { $_->{src_index} ? ($_) : () }
+                 values %protocols,
+                 values %protocolgroups,)
+{
+    $object->{is_used} or next;
+    print $object->{src_code}, "\n";
+}
+
 # Source of pathrestrictions can't be used literally,
 # but must be reconstructed from internal data structure.
 for my $restrict (sort by_index values %pathrestrictions) {
     my $used = 0;
     for my $interface (@{ $restrict->{elements} }) {
-        if ($interface->{is_used}) {
+        if ($is_used{$interface}) {
             $used++;
         }
         else {
